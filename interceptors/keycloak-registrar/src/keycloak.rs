@@ -29,12 +29,27 @@ pub struct KeycloakConfig {
     /// Client scopes (by name) every sandbox client gets as default scopes,
     /// typically one audience scope per target API.
     pub default_scopes: Vec<String>,
+    /// Separator in FGAP policy names between participant and audience.
+    pub policy_separator: String,
+    /// Human-readable gateway name (from `GATEWAY_ID`), used in policy names.
+    pub gateway_name: String,
+    /// Format template for sandbox-side FGAP policy names.
+    pub policy_sandbox_fmt: String,
+    /// Format template for gateway-side FGAP policy names.
+    pub policy_gateway_fmt: String,
 }
 
 pub struct KeycloakAdmin {
     config: KeycloakConfig,
     http: reqwest::Client,
     token: Mutex<Option<(String, Instant)>>,
+}
+
+/// Metadata extracted from the gRPC CreateSandbox response.
+#[derive(Debug, Clone, Default)]
+pub struct SandboxMeta {
+    pub name: String,
+    pub workspace: String,
 }
 
 #[derive(Deserialize)]
@@ -60,7 +75,11 @@ impl KeycloakAdmin {
 
     /// Creates or updates the sandbox's federated client, its default scopes,
     /// and the audience scope that lets the gateway address tokens to it.
-    pub async fn ensure_sandbox(&self, spiffe_id: &str) -> Result<(), String> {
+    pub async fn ensure_sandbox(
+        &self,
+        spiffe_id: &str,
+        meta: &SandboxMeta,
+    ) -> Result<(), String> {
         let representation = json!({
             "clientId": spiffe_id,
             "protocol": "openid-connect",
@@ -73,6 +92,9 @@ impl KeycloakAdmin {
                 "jwt.credential.issuer": self.config.identity_provider,
                 "jwt.credential.sub": spiffe_id,
                 "standard.token.exchange.enabled": "true",
+                "openshell.sandbox-name": meta.name,
+                "openshell.workspace": meta.workspace,
+                "openshell.gateway": self.config.gateway_name,
             },
         });
         let client = match self.client_uuid(spiffe_id).await? {
@@ -121,6 +143,91 @@ impl KeycloakAdmin {
             None,
         )
         .await?;
+
+        self.ensure_fgap_permissions(&client, spiffe_id, meta)
+            .await?;
+        Ok(())
+    }
+
+    /// Re-syncs FGAP permissions for all existing sandbox clients.
+    /// Called when a new audience client is added via the webhook, so that
+    /// existing sandboxes can exchange tokens to the new audience without
+    /// being recreated.
+    pub async fn sync_fgap_all_sandboxes(&self) -> Result<(), String> {
+        let all_clients = self
+            .admin(Method::GET, "/clients?max=200", None)
+            .await?;
+        let sandboxes: Vec<(String, String, SandboxMeta)> = all_clients
+            .as_array()
+            .map(|clients| {
+                clients
+                    .iter()
+                    .filter(|c| c["clientAuthenticatorType"] == "federated-jwt")
+                    .filter(|c| {
+                        c["clientId"]
+                            .as_str()
+                            .is_some_and(|id| id.contains("/sandbox/"))
+                    })
+                    .filter_map(|c| {
+                        let uuid = c["id"].as_str()?.to_string();
+                        let cid = c["clientId"].as_str()?.to_string();
+                        let meta = SandboxMeta {
+                            name: c["attributes"]["openshell.sandbox-name"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string(),
+                            workspace: c["attributes"]["openshell.workspace"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string(),
+                        };
+                        Some((uuid, cid, meta))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for (uuid, client_id, meta) in &sandboxes {
+            if let Err(e) = self.ensure_fgap_permissions(uuid, client_id, meta).await {
+                tracing::warn!(%uuid, %e, "FGAP sync failed for sandbox");
+            }
+        }
+        Ok(())
+    }
+
+    /// Creates a Keycloak client for an audience service (e.g. model-api)
+    /// with the `openshell.audience` and `standard.token.exchange.enabled` markers.
+    pub async fn ensure_audience_client(
+        &self,
+        client_id: &str,
+        namespace: &str,
+    ) -> Result<(), String> {
+        if self.client_uuid(client_id).await?.is_some() {
+            return Ok(());
+        }
+        let body = json!({
+            "clientId": client_id,
+            "enabled": true,
+            "publicClient": false,
+            "standardFlowEnabled": false,
+            "directAccessGrantsEnabled": false,
+            "serviceAccountsEnabled": false,
+            "attributes": {
+                "openshell.audience": "true",
+                "standard.token.exchange.enabled": "true",
+                "openshell.namespace": namespace,
+            },
+        });
+        self.admin(Method::POST, "/clients", Some(&body)).await?;
+        Ok(())
+    }
+
+    /// Removes a Keycloak audience client. Missing client is not an error.
+    pub async fn delete_audience_client(&self, client_id: &str) -> Result<(), String> {
+        if let Some(uuid) = self.client_uuid(client_id).await? {
+            self.admin_allow_missing(Method::DELETE, &format!("/clients/{uuid}"))
+                .await?;
+        }
         Ok(())
     }
 
@@ -190,6 +297,270 @@ impl KeycloakAdmin {
             .await?;
         }
         Ok(scope)
+    }
+
+    /// Configures FGAP v1 token-exchange permissions so this sandbox client
+    /// can exchange tokens to each configured audience client.
+    ///
+    /// When the `admin-fine-grained-authz:v1` feature is active on the realm,
+    /// `standard.token.exchange.enabled` is ignored; permissions must be set
+    /// explicitly on the realm-management authorization server.
+    /// Returns `(uuid, clientId, namespace)` for each audience client.
+    async fn discover_audience_clients(&self) -> Result<Vec<(String, String, String)>, String> {
+        let all_clients = self
+            .admin(Method::GET, "/clients?max=200", None)
+            .await?;
+        let mut audiences = vec![];
+        if let Some(clients) = all_clients.as_array() {
+            for client in clients {
+                let is_federated = client["clientAuthenticatorType"] == "federated-jwt";
+                let is_realm_mgmt = client["clientId"] == "realm-management";
+                let is_admin = client["clientId"] == "admin-cli";
+                let is_registrar = client["clientId"] == "keycloak-registrar";
+                let is_builtin = client["clientId"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("account") || id == "broker" || id == "security-admin-console");
+                if is_federated || is_realm_mgmt || is_admin || is_registrar || is_builtin {
+                    continue;
+                }
+                let has_exchange = client["attributes"]["standard.token.exchange.enabled"]
+                    .as_str()
+                    .is_some_and(|v| v == "true");
+                let has_marker = client["attributes"]["openshell.audience"]
+                    .as_str()
+                    .is_some_and(|v| v == "true");
+                if has_exchange || has_marker {
+                    if let (Some(uuid), Some(cid)) = (client["id"].as_str(), client["clientId"].as_str()) {
+                        let ns = client["attributes"]["openshell.namespace"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                        audiences.push((uuid.to_string(), cid.to_string(), ns));
+                    }
+                }
+            }
+        }
+        Ok(audiences)
+    }
+
+    async fn ensure_fgap_permissions(
+        &self,
+        sandbox_uuid: &str,
+        sandbox_client_id: &str,
+        meta: &SandboxMeta,
+    ) -> Result<(), String> {
+        let realm_mgmt = match self.client_uuid("realm-management").await? {
+            Some(uuid) => uuid,
+            None => return Ok(()),
+        };
+
+        let tx_scope_id = self.token_exchange_scope_id(&realm_mgmt).await?;
+        let tx_scope_id = match tx_scope_id {
+            Some(id) => id,
+            None => return Ok(()),
+        };
+
+        let gateway_client_id = &self.config.gateway_client_id;
+        let gateway_uuid = self
+            .client_uuid(gateway_client_id)
+            .await?
+            .ok_or_else(|| format!("gateway client {gateway_client_id:?} not found"))?;
+
+        // Discover audience clients (uuid, clientId, namespace).
+        let discovered = self.discover_audience_clients().await?;
+        let mut targets: Vec<(String, String, String)> = if !discovered.is_empty() {
+            discovered
+        } else {
+            let mut from_scopes = vec![];
+            for scope_name in &self.config.default_scopes {
+                if let Some(uuid) = self.client_uuid(scope_name).await? {
+                    from_scopes.push((uuid, scope_name.clone(), String::new()));
+                }
+            }
+            from_scopes
+        };
+
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        // Also enable FGAP on the sandbox and gateway themselves.
+        if !targets.iter().any(|(u, _, _)| u == sandbox_uuid) {
+            targets.push((sandbox_uuid.to_string(), sandbox_client_id.to_string(), String::new()));
+        }
+        if !targets.iter().any(|(u, _, _)| u == &gateway_uuid) {
+            targets.push((gateway_uuid.clone(), gateway_client_id.clone(), String::new()));
+        }
+
+        let gateway_id = &self.config.gateway_name;
+        let workspace = if meta.workspace.is_empty() { "default" } else { &meta.workspace };
+        let sandbox_name = if meta.name.is_empty() { &sandbox_uuid[..8.min(sandbox_uuid.len())] } else { &meta.name };
+        let sep = &self.config.policy_separator;
+        let uuid8 = &sandbox_uuid[..8.min(sandbox_uuid.len())];
+
+        for (target_uuid, target_client_id, target_ns) in &targets {
+            self.admin(
+                Method::PUT,
+                &format!("/clients/{target_uuid}/management/permissions"),
+                Some(&json!({"enabled": true})),
+            )
+            .await?;
+
+            let mgmt_info = self
+                .admin(
+                    Method::GET,
+                    &format!("/clients/{target_uuid}/management/permissions"),
+                    None,
+                )
+                .await?;
+            let tx_perm_id = match mgmt_info["scopePermissions"]["token-exchange"].as_str() {
+                Some(id) => id.to_string(),
+                None => continue,
+            };
+            let resource_id = mgmt_info["resource"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+
+            let v = [
+                ("{gateway_id}", gateway_id.as_str()),
+                ("{workspace}", workspace),
+                ("{sandbox_name}", sandbox_name),
+                ("{audience}", target_client_id.as_str()),
+                ("{audience_ns}", target_ns.as_str()),
+                ("{sep}", sep.as_str()),
+                ("{uuid8}", uuid8),
+            ];
+            let sandbox_policy_name = render_template(&self.config.policy_sandbox_fmt, &v);
+            let sandbox_policy_id = self
+                .ensure_client_policy(&realm_mgmt, &sandbox_policy_name, sandbox_uuid)
+                .await?;
+
+            let gateway_policy_name = render_template(&self.config.policy_gateway_fmt, &v);
+            let gateway_policy_id = self
+                .ensure_client_policy(&realm_mgmt, &gateway_policy_name, &gateway_uuid)
+                .await?;
+
+            let existing = self.permission_policy_ids(&realm_mgmt, &tx_perm_id).await?;
+            let mut all_policies = existing;
+            for id in [&sandbox_policy_id, &gateway_policy_id] {
+                if !all_policies.contains(id) {
+                    all_policies.push(id.clone());
+                }
+            }
+
+            let perm_body = json!({
+                "id": tx_perm_id,
+                "name": format!("token-exchange.permission.client.{target_uuid}"),
+                "type": "scope",
+                "logic": "POSITIVE",
+                "decisionStrategy": "AFFIRMATIVE",
+                "resources": [resource_id],
+                "scopes": [tx_scope_id],
+                "policies": all_policies,
+            });
+            self.admin(
+                Method::PUT,
+                &format!(
+                    "/clients/{realm_mgmt}/authz/resource-server/permission/scope/{tx_perm_id}"
+                ),
+                Some(&perm_body),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn permission_policy_ids(
+        &self,
+        realm_mgmt_uuid: &str,
+        perm_id: &str,
+    ) -> Result<Vec<String>, String> {
+        let perm = self
+            .admin(
+                Method::GET,
+                &format!(
+                    "/clients/{realm_mgmt_uuid}/authz/resource-server/policy/{perm_id}/associatedPolicies"
+                ),
+                None,
+            )
+            .await;
+        match perm {
+            Ok(val) => Ok(val
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|p| p["id"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()),
+            Err(_) => Ok(vec![]),
+        }
+    }
+
+    async fn token_exchange_scope_id(
+        &self,
+        realm_mgmt_uuid: &str,
+    ) -> Result<Option<String>, String> {
+        let scopes = self
+            .admin(
+                Method::GET,
+                &format!(
+                    "/clients/{realm_mgmt_uuid}/authz/resource-server/scope?name=token-exchange"
+                ),
+                None,
+            )
+            .await?;
+        Ok(scopes
+            .as_array()
+            .and_then(|list| list.first())
+            .and_then(|s| s["id"].as_str())
+            .map(str::to_string))
+    }
+
+    async fn ensure_client_policy(
+        &self,
+        realm_mgmt_uuid: &str,
+        policy_name: &str,
+        client_uuid: &str,
+    ) -> Result<String, String> {
+        let body = json!({
+            "name": policy_name,
+            "type": "client",
+            "logic": "POSITIVE",
+            "decisionStrategy": "UNANIMOUS",
+            "clients": [client_uuid],
+        });
+        let result = self
+            .admin(
+                Method::POST,
+                &format!("/clients/{realm_mgmt_uuid}/authz/resource-server/policy/client"),
+                Some(&body),
+            )
+            .await;
+        match result {
+            Ok(val) if val["id"].is_string() => {
+                Ok(val["id"].as_str().unwrap().to_string())
+            }
+            Ok(_) | Err(_) => {
+                let existing = self
+                    .admin(
+                        Method::GET,
+                        &format!(
+                            "/clients/{realm_mgmt_uuid}/authz/resource-server/policy?name={}",
+                            urlencode(policy_name)
+                        ),
+                        None,
+                    )
+                    .await?;
+                existing
+                    .as_array()
+                    .and_then(|list| list.first())
+                    .and_then(|p| p["id"].as_str())
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("failed to create or find policy {policy_name}"))
+            }
+        }
     }
 
     async fn client_uuid(&self, client_id: &str) -> Result<Option<String>, String> {
@@ -297,6 +668,14 @@ impl KeycloakAdmin {
         ));
         Ok(token.access_token)
     }
+}
+
+fn render_template(template: &str, vars: &[(&str, &str)]) -> String {
+    let mut result = template.to_string();
+    for (key, value) in vars {
+        result = result.replace(key, value);
+    }
+    result
 }
 
 fn urlencode(value: &str) -> String {
@@ -575,14 +954,25 @@ mod tests {
             identity_provider: "spiffe".to_string(),
             gateway_client_id: GATEWAY.to_string(),
             default_scopes: vec!["alpha-svc".to_string()],
+            policy_separator: " <-> ".to_string(),
+            gateway_name: "test-gw".to_string(),
+            policy_sandbox_fmt: "os://{gateway_id}/workspaces/{workspace}/sandboxes/{sandbox_name}/supervisor{sep}k8s://{audience_ns}/{audience}".to_string(),
+            policy_gateway_fmt: "os://{gateway_id}/gateway{sep}k8s://{audience_ns}/{audience}".to_string(),
         });
         (admin, state)
+    }
+
+    fn test_meta() -> SandboxMeta {
+        SandboxMeta {
+            name: "agent-a".to_string(),
+            workspace: "default".to_string(),
+        }
     }
 
     #[tokio::test]
     async fn ensure_sandbox_creates_federated_client() {
         let (admin, state) = setup().await;
-        admin.ensure_sandbox(SANDBOX).await.unwrap();
+        admin.ensure_sandbox(SANDBOX, &test_meta()).await.unwrap();
 
         let realm = state.lock().unwrap();
         let (_, client) = realm.client_by_client_id(SANDBOX).expect("sandbox client");
@@ -599,7 +989,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_sandbox_attaches_target_scope_and_gateway_audience() {
         let (admin, state) = setup().await;
-        admin.ensure_sandbox(SANDBOX).await.unwrap();
+        admin.ensure_sandbox(SANDBOX, &test_meta()).await.unwrap();
 
         let realm = state.lock().unwrap();
         let (sandbox_id, _) = realm.client_by_client_id(SANDBOX).unwrap();
@@ -621,8 +1011,8 @@ mod tests {
     #[tokio::test]
     async fn ensure_sandbox_is_idempotent() {
         let (admin, state) = setup().await;
-        admin.ensure_sandbox(SANDBOX).await.unwrap();
-        admin.ensure_sandbox(SANDBOX).await.unwrap();
+        admin.ensure_sandbox(SANDBOX, &test_meta()).await.unwrap();
+        admin.ensure_sandbox(SANDBOX, &test_meta()).await.unwrap();
 
         let realm = state.lock().unwrap();
         let sandbox_clients = realm
@@ -648,7 +1038,7 @@ mod tests {
     #[tokio::test]
     async fn admin_token_uses_client_credentials_and_is_cached() {
         let (admin, state) = setup().await;
-        admin.ensure_sandbox(SANDBOX).await.unwrap();
+        admin.ensure_sandbox(SANDBOX, &test_meta()).await.unwrap();
         admin.delete_sandbox(SANDBOX).await.unwrap();
 
         let realm = state.lock().unwrap();
@@ -661,7 +1051,7 @@ mod tests {
     #[tokio::test]
     async fn delete_sandbox_removes_client_scope_and_gateway_link() {
         let (admin, state) = setup().await;
-        admin.ensure_sandbox(SANDBOX).await.unwrap();
+        admin.ensure_sandbox(SANDBOX, &test_meta()).await.unwrap();
         admin.delete_sandbox(SANDBOX).await.unwrap();
 
         let realm = state.lock().unwrap();
@@ -685,7 +1075,7 @@ mod tests {
     async fn missing_default_scope_is_an_error() {
         let (admin, state) = setup().await;
         state.lock().unwrap().scopes.clear();
-        let err = admin.ensure_sandbox(SANDBOX).await.unwrap_err();
+        let err = admin.ensure_sandbox(SANDBOX, &test_meta()).await.unwrap_err();
         assert!(err.contains("alpha-svc"), "{err}");
     }
 
@@ -700,8 +1090,40 @@ mod tests {
             identity_provider: "spiffe".to_string(),
             gateway_client_id: GATEWAY.to_string(),
             default_scopes: vec![],
+            policy_separator: " <-> ".to_string(),
+            gateway_name: "test-gw".to_string(),
+            policy_sandbox_fmt: "{sandbox_name}".to_string(),
+            policy_gateway_fmt: "{gateway_id}".to_string(),
         });
-        let err = admin.ensure_sandbox(SANDBOX).await.unwrap_err();
+        let err = admin.ensure_sandbox(SANDBOX, &test_meta()).await.unwrap_err();
         assert!(err.contains("401"), "{err}");
+    }
+
+    #[test]
+    fn render_template_replaces_all_variables() {
+        let vars = [
+            ("{gateway_id}", "saw-cluster"),
+            ("{workspace}", "default"),
+            ("{sandbox_name}", "model-demo"),
+            ("{audience}", "model-api"),
+            ("{audience_ns}", "openshell-demo"),
+            ("{sep}", " <-> "),
+            ("{uuid8}", "c7a91a22"),
+        ];
+        assert_eq!(
+            render_template(
+                "os://{gateway_id}/workspaces/{workspace}/sandboxes/{sandbox_name}/supervisor{sep}k8s://{audience_ns}/{audience}",
+                &vars,
+            ),
+            "os://saw-cluster/workspaces/default/sandboxes/model-demo/supervisor <-> k8s://openshell-demo/model-api"
+        );
+        assert_eq!(
+            render_template("os://{gateway_id}/gateway{sep}k8s://{audience_ns}/{audience}", &vars),
+            "os://saw-cluster/gateway <-> k8s://openshell-demo/model-api"
+        );
+        assert_eq!(
+            render_template("sandbox({uuid8}){sep}audience({audience})", &vars),
+            "sandbox(c7a91a22) <-> audience(model-api)"
+        );
     }
 }
